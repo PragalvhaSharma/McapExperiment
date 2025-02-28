@@ -56,9 +56,11 @@ class DataHandler:
             return pd.DataFrame()
             
         try:
-            # Calculate technical indicators
-            df['SMA_20'] = df['close'].rolling(window=20).mean()
-            df['SMA_50'] = df['close'].rolling(window=50).mean()
+            # Calculate required SMAs
+            df['SMA_30'] = df['close'].rolling(window=30).mean()
+            df['SMA_60'] = df['close'].rolling(window=60).mean()
+            df['SMA_120'] = df['close'].rolling(window=120).mean()
+            df['SMA_200'] = df['close'].rolling(window=200).mean()
             
             # RSI
             delta = df['close'].diff()
@@ -98,4 +100,4 @@ class DataHandler:
                 # Remove any NaN values that might have been created
                 data = data.dropna()
                 return data
-        return pd.DataFrame() 
+        return pd.DataFrame()
