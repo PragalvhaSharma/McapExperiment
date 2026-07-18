@@ -2,71 +2,57 @@ import sys
 from typing import Optional
 
 
-class _Cell:
-    """A single power cell.
-
-    The charge window of a cell at some ``timestamp`` is
-    ``load_ts + rated_duration - timestamp``.  Because that value only shifts by
-    a constant (``-timestamp``) for every cell simultaneously, the *relative*
-    ordering of cells by charge window never changes over time and can be driven
-    purely by ``priority = load_ts + rated_duration``.
-    """
-
-    __slots__ = ("cell_id", "load_ts", "rated_duration", "priority")
-
-    def __init__(self, cell_id: str, load_ts: float, rated_duration: float) -> None:
-        self.cell_id = cell_id
-        self.load_ts = load_ts
-        self.rated_duration = rated_duration
-        self.priority = load_ts + rated_duration
-
-    def is_spent(self, timestamp: float) -> bool:
-        return timestamp - self.load_ts >= 2.0 * self.rated_duration
-
-    def is_charged(self, timestamp: float) -> bool:
-        return timestamp - self.load_ts < self.rated_duration
-
-
 class PowerCellBank:
     def __init__(self, num_racks: int) -> None:
         self.num_racks = num_racks
         # racks[i] models rack (i + 1); rack 1 (index 0) is the front rack.
-        self.racks: list[list[_Cell]] = [[] for _ in range(num_racks)]
+        # Each cell is a tuple: (priority, cell_id, load_ts, rated_duration)
+        # where priority = load_ts + rated_duration drives the charge-window
+        # ordering (the window differs from priority only by a constant -ts,
+        # so the relative ordering of cells is time-invariant).
+        self.racks: list[list[tuple[float, str, float, float]]] = [
+            [] for _ in range(num_racks)
+        ]
         # Rack i (1-indexed) has capacity 2^i.
         self.capacity: list[int] = [1 << (i + 1) for i in range(num_racks)]
 
-    # ------------------------------------------------------------------ #
-    # Spent-cell handling
-    # ------------------------------------------------------------------ #
-    def _purge_rack(self, idx: int, timestamp: float) -> None:
-        rack = self.racks[idx]
-        alive = [c for c in rack if not c.is_spent(timestamp)]
-        if len(alive) != len(rack):
-            self.racks[idx] = alive
-
-    def _purge_all(self, timestamp: float) -> None:
-        for i in range(self.num_racks):
-            self._purge_rack(i, timestamp)
-
-    # ------------------------------------------------------------------ #
-    # LoadCell
-    # ------------------------------------------------------------------ #
     def load_cell(self, timestamp: float, cell_id: str, rated_duration: float) -> bool:
         for i in range(self.num_racks):
             self._purge_rack(i, timestamp)
             if len(self.racks[i]) < self.capacity[i]:
-                self.racks[i].append(_Cell(cell_id, timestamp, rated_duration))
+                priority = timestamp + rated_duration
+                self.racks[i].append((priority, cell_id, timestamp, rated_duration))
                 return True
         return False
 
-    # ------------------------------------------------------------------ #
-    # Discharge
-    # ------------------------------------------------------------------ #
     def discharge(self, timestamp: float, max_dispatch: int) -> list[str]:
-        self._purge_all(timestamp)
+        for i in range(self.num_racks):
+            self._purge_rack(i, timestamp)
         self._equalise(timestamp)
         return self._bus_shift(timestamp, max_dispatch)
 
+    # ------------------------------------------------------------------ #
+    # Temporal-state helpers (t = timestamp - load_ts)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _is_spent(cell: tuple[float, str, float, float], timestamp: float) -> bool:
+        _, _, load_ts, rated = cell
+        return timestamp - load_ts >= 2.0 * rated
+
+    @staticmethod
+    def _is_charged(cell: tuple[float, str, float, float], timestamp: float) -> bool:
+        _, _, load_ts, rated = cell
+        return timestamp - load_ts < rated
+
+    def _purge_rack(self, idx: int, timestamp: float) -> None:
+        rack = self.racks[idx]
+        alive = [c for c in rack if not self._is_spent(c, timestamp)]
+        if len(alive) != len(rack):
+            self.racks[idx] = alive
+
+    # ------------------------------------------------------------------ #
+    # Charge Equalisation
+    # ------------------------------------------------------------------ #
     def _equalise(self, timestamp: float) -> None:
         for k in range(self.num_racks - 1):
             rack_k = self.racks[k]
@@ -76,22 +62,20 @@ class PowerCellBank:
             if total_k == 0:
                 continue
 
-            charged_k = sum(1 for c in rack_k if c.is_charged(timestamp))
+            charged_k = sum(1 for c in rack_k if self._is_charged(c, timestamp))
             # below-sag: charged fraction strictly below 50% -> 2*charged < total
             if not (2 * charged_k < total_k):
                 continue
 
-            # rack k+1's charged cells ordered most-charged first
+            # rack k+1's charged cells, most-charged first
             # (largest priority, ties broken by smallest cell_id).
-            kp1_charged = [c for c in rack_kp1 if c.is_charged(timestamp)]
+            kp1_charged = [c for c in rack_kp1 if self._is_charged(c, timestamp)]
             if not kp1_charged:
                 continue
-            kp1_charged.sort(key=lambda c: (-c.priority, c.cell_id))
+            kp1_charged.sort(key=lambda c: (-c[0], c[1]))
 
             # Each balance swap moves out one of rack k's depleted cells and
             # brings in a charged cell, so charged_k grows by one per swap.
-            # Determine how many swaps run before rack k is no longer below-sag
-            # or rack k+1 runs out of charged cells.
             swaps = 0
             ch = charged_k
             while 2 * ch < total_k and swaps < len(kp1_charged):
@@ -101,7 +85,7 @@ class PowerCellBank:
                 continue
 
             # rack k's most-depleted cells: smallest priority, ties smallest id.
-            k_sorted = sorted(rack_k, key=lambda c: (c.priority, c.cell_id))
+            k_sorted = sorted(rack_k, key=lambda c: (c[0], c[1]))
             depleted_out = k_sorted[:swaps]
             charged_in = kp1_charged[:swaps]
 
@@ -111,6 +95,9 @@ class PowerCellBank:
             self.racks[k] = [c for c in rack_k if id(c) not in out_ids] + charged_in
             self.racks[k + 1] = [c for c in rack_kp1 if id(c) not in in_ids] + depleted_out
 
+    # ------------------------------------------------------------------ #
+    # Bus Shift
+    # ------------------------------------------------------------------ #
     def _bus_shift(self, timestamp: float, max_dispatch: int) -> list[str]:
         result: list[str] = []
         for _ in range(max_dispatch):
@@ -124,8 +111,8 @@ class PowerCellBank:
                 break
 
             cell = self._pop_most_charged(active)
-            state = "charged" if cell.is_charged(timestamp) else "depleted"
-            result.append(f"{cell.cell_id}:{state}")
+            state = "charged" if self._is_charged(cell, timestamp) else "depleted"
+            result.append(f"{cell[1]}:{state}")
 
             # Inward shift: cascade the most-charged cell forward from each rack
             # behind, halting when the next rack back is empty or absent.
@@ -135,15 +122,14 @@ class PowerCellBank:
                 r += 1
         return result
 
-    def _pop_most_charged(self, idx: int) -> _Cell:
+    def _pop_most_charged(self, idx: int) -> tuple[float, str, float, float]:
         rack = self.racks[idx]
         best = 0
         best_cell = rack[0]
         for i in range(1, len(rack)):
             c = rack[i]
-            if c.priority > best_cell.priority or (
-                c.priority == best_cell.priority and c.cell_id < best_cell.cell_id
-            ):
+            # most-charged: larger priority, ties broken by smaller cell_id
+            if c[0] > best_cell[0] or (c[0] == best_cell[0] and c[1] < best_cell[1]):
                 best = i
                 best_cell = c
         return rack.pop(best)
